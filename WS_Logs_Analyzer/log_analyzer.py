@@ -2,9 +2,20 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import os
 import re
-from datetime import datetime
-import threading
-import time
+from collections import defaultdict
+
+# --- Pre-compiled Regex for Performance ---
+HIGHLIGHT_PATTERNS = {
+    "error": re.compile(r'\b(ERROR|EXCEPTION|CRITICAL|FAILED)\b', re.IGNORECASE),
+    "warning": re.compile(r'\b(WARNING|WARN|DEPRECATED)\b', re.IGNORECASE),
+    "info": re.compile(r'\b(COMMAND|EXECUTE|INVOKE|STEP)\b', re.IGNORECASE),
+    "loglevel_engine": re.compile(r'\bEngine\b'),
+    "loglevel_debug": re.compile(r'\bDebug\b'),
+    "loglevel_info": re.compile(r'\bInfo\b'),
+    "loglevel_trace": re.compile(r'\bTrace\b'),
+    # Error level is already covered by the 'error' tag pattern
+}
+
 
 class LogAnalyzerApp:
     """
@@ -21,17 +32,9 @@ class LogAnalyzerApp:
         self.all_log_lines = []
         self.current_file = ""
         self.file_size = 0
-        self.monitoring = False
-        self.monitor_thread = None
-
-        # Filter preset patterns
-        self.filter_presets = {
-            "Errors": r"(?i)(error|failed|exception|critical)",
-            "Warnings": r"(?i)(warning|warn|deprecated)",
-            "Commands": r"(?i)(command|cmd|execute|invoke)",
-            "Timing": r"(?i)(time|duration|elapsed|ms|sec)",
-            "All": ""
-        }
+        self.log_selection_window = None
+        self.level_filter_vars = {}
+        self.source_engine_only_var = tk.BooleanVar(value=False)
 
         # --- UI Setup ---
         self._setup_widgets()
@@ -50,16 +53,6 @@ class LogAnalyzerApp:
         self.notebook.add(self.viewer_frame, text="Log Viewer")
         self._setup_viewer_tab()
 
-        # Tab 2: Time Analysis
-        self.timing_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.timing_frame, text="Command Timing")
-        self._setup_timing_tab()
-
-        # Tab 3: Real-time Monitor
-        self.monitor_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.monitor_frame, text="Real-Time Monitor")
-        self._setup_monitor_tab()
-
     def _setup_viewer_tab(self):
         """Setup the main log viewer tab."""
         frm = ttk.Frame(self.viewer_frame, padding="10")
@@ -69,42 +62,57 @@ class LogAnalyzerApp:
         controls_frame = ttk.Frame(frm)
         controls_frame.pack(fill="x", pady=(0, 10))
 
-        load_button = ttk.Button(controls_frame, text="Load Log File", command=self.load_log_file)
+        load_button = ttk.Button(controls_frame, text="Browse for Logs...", command=self.open_log_browser)
         load_button.pack(side="left", padx=(0, 10))
 
         self.file_label_var = tk.StringVar(value="No file loaded.")
         file_label = ttk.Label(controls_frame, textvariable=self.file_label_var, anchor="w", relief="sunken", width=40)
         file_label.pack(side="left", fill="x", expand=True)
 
-        # --- Filter Type Selection ---
-        filter_type_frame = ttk.Frame(frm)
-        filter_type_frame.pack(fill="x", pady=(0, 10))
+        # --- Filter Controls ---
+        filter_frame = ttk.Frame(frm)
+        filter_frame.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(filter_type_frame, text="Filter Type:").pack(side="left", padx=(0, 5))
-        self.filter_type_var = tk.StringVar(value="Keyword Search")
-        filter_types = ["Keyword Search", "Errors", "Warnings", "Commands", "Timing", "Custom Regex"]
-        self.filter_type_combo = ttk.Combobox(filter_type_frame, textvariable=self.filter_type_var, 
-                                              values=filter_types, state="readonly", width=20)
-        self.filter_type_combo.pack(side="left", padx=(0, 10))
-        self.filter_type_combo.bind("<<ComboboxSelected>>", self._on_filter_type_change)
-
-        ttk.Label(filter_type_frame, text="Search Term:").pack(side="left", padx=(0, 5))
+        ttk.Label(filter_frame, text="Search:").pack(side="left", padx=(0, 5))
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", self.on_filter_change)
-        filter_entry = ttk.Entry(filter_type_frame, textvariable=self.filter_var, width=40)
+        filter_entry = ttk.Entry(filter_frame, textvariable=self.filter_var, width=40)
         filter_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        clear_button = ttk.Button(filter_type_frame, text="Clear", command=self.clear_filter)
+        clear_button = ttk.Button(filter_frame, text="Clear", command=self.clear_filter)
         clear_button.pack(side="left", padx=(0, 5))
 
         self.case_sensitive_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filter_type_frame, text="Case Sensitive", variable=self.case_sensitive_var, 
+        ttk.Checkbutton(filter_frame, text="Case Sensitive", variable=self.case_sensitive_var, 
                        command=self.apply_filter).pack(side="left")
+        
+        self.command_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filter_frame, text="Command Only", variable=self.command_only_var,
+                       command=self.apply_filter).pack(side="left", padx=(10, 0))
+
+        ttk.Checkbutton(filter_frame, text="Source 'Engine' Only", variable=self.source_engine_only_var,
+                       command=self.apply_filter).pack(side="left", padx=(10, 0))
+
+        # --- Log Level Filter ---
+        level_filter_frame = ttk.Frame(frm)
+        level_filter_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(level_filter_frame, text="Levels:").pack(side="left", padx=(0, 5))
+
+        levels = ["TRACE", "ENGINE", "DEBUG", "INFO", "ERROR"]
+        for level in levels:
+            var = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(level_filter_frame, text=level, variable=var, command=self.apply_filter)
+            cb.pack(side="left", padx=5)
+            self.level_filter_vars[level] = var
+
+        # Option to force highlighting even for large result sets
+        # (removed Always highlight checkbox to avoid accidental heavy highlighting)
 
         # --- Log Display Area ---
         self.log_text = scrolledtext.ScrolledText(
             frm,
-            wrap=tk.WORD,
+            wrap=tk.NONE,
             font=("Courier New", 9),
             state="disabled"
         )
@@ -115,301 +123,305 @@ class LogAnalyzerApp:
         self.log_text.tag_configure("error", background="red", foreground="white")
         self.log_text.tag_configure("warning", background="orange", foreground="black")
         self.log_text.tag_configure("info", background="lightblue", foreground="black")
+        # Log level tags
+        self.log_text.tag_configure("loglevel_engine", background="#FFD700", foreground="black", font=("Courier New", 9, "bold"))  # Gold
+        self.log_text.tag_configure("loglevel_debug", background="#87CEEB", foreground="black", font=("Courier New", 9, "bold"))   # Sky Blue
+        self.log_text.tag_configure("loglevel_info", background="#90EE90", foreground="black", font=("Courier New", 9, "bold"))    # Light Green
+        self.log_text.tag_configure("loglevel_trace", background="#DDA0DD", foreground="black", font=("Courier New", 9, "bold"))   # Plum
+        self.log_text.tag_configure("loglevel_error", background="#FF6B6B", foreground="white", font=("Courier New", 9, "bold"))   # Red
 
-    def _setup_timing_tab(self):
-        """Setup the command timing analysis tab."""
-        frm = ttk.Frame(self.timing_frame, padding="10")
+    def apply_filter(self):
+        """Filter and highlight log lines based on the search term and selected levels."""
+        filter_term = self.filter_var.get()
+
+        # Start with all lines
+        working_lines = self.all_log_lines
+
+        # --- Level Filtering ---
+        if hasattr(self, 'level_filter_vars') and self.level_filter_vars:
+            selected_levels = [level for level, var in self.level_filter_vars.items() if var.get()]
+            
+            if selected_levels:
+                level_pattern = r'\b(' + '|'.join(re.escape(level) for level in selected_levels) + r')\b'
+                level_regex = re.compile(level_pattern, re.IGNORECASE)
+                
+                level_filtered_lines = []
+                for line in working_lines:
+                    parts = line.split(" - ")
+                    if len(parts) >= 2:
+                        line_level = parts[1].strip()
+                        if level_regex.search(line_level):
+                            level_filtered_lines.append(line)
+                working_lines = level_filtered_lines
+            else:
+                # No levels selected, show nothing.
+                working_lines = []
+
+        # --- Source 'Engine' Filtering ---
+        if self.source_engine_only_var.get():
+            engine_filtered_lines = []
+            for line in working_lines:
+                parts = line.split(" - ")
+                if len(parts) >= 3:
+                    source = parts[2].strip()
+                    if source == "Engine":
+                        engine_filtered_lines.append(line)
+            working_lines = engine_filtered_lines
+
+        # --- Text Filtering ---
+        if filter_term:
+            case_sensitive = self.case_sensitive_var.get()
+            
+            if case_sensitive:
+                text_filtered_lines = [line for line in working_lines if filter_term in line]
+            else:
+                text_filtered_lines = [line for line in working_lines if filter_term.lower() in line.lower()]
+            working_lines = text_filtered_lines
+        
+        self.display_logs(working_lines, highlight_term=filter_term, is_regex=False)
+
+    def open_log_browser(self):
+        """Open a dialog to select a directory and then show a log selection window."""
+        default_log_dir = r"C:\ProgramData\MVG\Wave Studio"
+        initial_dir = default_log_dir if os.path.isdir(default_log_dir) else (self.log_dir if os.path.isdir(self.log_dir) else os.getcwd())
+        
+        dir_path = filedialog.askdirectory(
+            initialdir=initial_dir,
+            title="Select Directory Containing Logs"
+        )
+        
+        if not dir_path:
+            return
+
+        log_files = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f)) and re.match(r"^application\.log(\.\d+)?$", f)]
+        log_files.sort(key=lambda f: int(f.split('.')[-1]) if f.split('.')[-1].isdigit() else -1) # Sort numerically
+
+        if not log_files:
+            messagebox.showinfo("No Logs Found", f"No 'application.log' or 'application.log.X' files found in '{dir_path}'.")
+            return
+
+        self._create_log_selection_window(dir_path, log_files)
+
+    def _create_log_selection_window(self, dir_path, log_files):
+        """Creates a Toplevel window for selecting which log files to load."""
+        if self.log_selection_window and self.log_selection_window.winfo_exists():
+            self.log_selection_window.destroy()
+
+        self.log_selection_window = tk.Toplevel(self.root)
+        self.log_selection_window.title("Select Logs to Load")
+        self.log_selection_window.geometry("400x500")
+
+        frm = ttk.Frame(self.log_selection_window, padding=10)
         frm.pack(fill="both", expand=True)
 
-        # Controls
-        ctrl_frame = ttk.Frame(frm)
-        ctrl_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(frm, text=f"Found logs in: {dir_path}", wraplength=380).pack(fill="x", pady=(0, 10))
 
-        ttk.Button(ctrl_frame, text="Analyze Timings", command=self.analyze_timings).pack(side="left", padx=(0, 10))
-        ttk.Button(ctrl_frame, text="Export Results", command=self.export_timings).pack(side="left")
+        # --- File list with checkboxes ---
+        list_frame = ttk.Frame(frm)
+        list_frame.pack(fill="both", expand=True, pady=5)
+        
+        self.log_file_vars = {}
+        for i, log_file in enumerate(log_files):
+            # Default to selecting only the first log file (application.log)
+            is_selected = (i == 0)
+            var = tk.BooleanVar(value=is_selected)
+            cb = ttk.Checkbutton(list_frame, text=log_file, variable=var)
+            cb.pack(anchor="w")
+            self.log_file_vars[log_file] = var
 
-        ttk.Label(ctrl_frame, text="Command Pattern:").pack(side="left", padx=(10, 5))
-        self.timing_pattern_var = tk.StringVar(value=r"(?i)(command|execute|step)")
-        ttk.Entry(ctrl_frame, textvariable=self.timing_pattern_var, width=40).pack(side="left", padx=(0, 10))
+        # --- Control buttons ---
+        btn_frame = ttk.Frame(frm)
+        btn_frame.pack(fill="x", pady=(10, 0))
 
-        # Results display
-        results_frame = ttk.Frame(frm)
-        results_frame.pack(fill="both", expand=True)
+        load_btn = ttk.Button(btn_frame, text="Load Selected Logs", 
+                              command=lambda: self.load_selected_logs(dir_path))
+        load_btn.pack(side="right")
 
-        ttk.Label(results_frame, text="Timing Analysis Results:", font=("Arial", 10, "bold")).pack(anchor="w")
+        cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self.log_selection_window.destroy)
+        cancel_btn.pack(side="right", padx=(0, 10))
 
-        self.timing_text = scrolledtext.ScrolledText(
-            results_frame,
-            wrap=tk.WORD,
-            font=("Courier New", 9),
-            state="disabled",
-            height=20
-        )
-        self.timing_text.pack(fill="both", expand=True)
+    def load_selected_logs(self, dir_path):
+        """Concatenates and loads the logs selected in the browser window."""
+        selected_files = [os.path.join(dir_path, f) for f, var in self.log_file_vars.items() if var.get()]
 
-    def _setup_monitor_tab(self):
-        """Setup the real-time log monitoring tab."""
-        frm = ttk.Frame(self.monitor_frame, padding="10")
-        frm.pack(fill="both", expand=True)
-
-        # Controls
-        ctrl_frame = ttk.Frame(frm)
-        ctrl_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(ctrl_frame, text="Log File Path:").pack(side="left", padx=(0, 5))
-        self.monitor_path_var = tk.StringVar(value=r"C:\workspace\WS_Logs_Analyzer\application.log")
-        self.monitor_path_entry = ttk.Entry(ctrl_frame, textvariable=self.monitor_path_var, width=60)
-        self.monitor_path_entry.pack(side="left", padx=(0, 10), fill="x", expand=True)
-
-        ttk.Button(ctrl_frame, text="Browse", command=self._browse_monitor_file).pack(side="left", padx=(0, 10))
-
-        self.monitor_button = ttk.Button(ctrl_frame, text="Start Monitoring", command=self.toggle_monitoring, 
-                                        style="")
-        self.monitor_button.pack(side="left", padx=(0, 10))
-
-        ttk.Label(ctrl_frame, text="Refresh (sec):").pack(side="left", padx=(0, 5))
-        self.refresh_rate_var = tk.StringVar(value="1")
-        ttk.Spinbox(ctrl_frame, from_=0.5, to=10, textvariable=self.refresh_rate_var, width=5).pack(side="left")
-
-        # Status indicator
-        self.monitor_status_var = tk.StringVar(value="Status: Idle")
-        ttk.Label(ctrl_frame, textvariable=self.monitor_status_var, foreground="gray").pack(side="left", padx=(10, 0))
-
-        # Real-time display
-        self.monitor_text = scrolledtext.ScrolledText(
-            frm,
-            wrap=tk.WORD,
-            font=("Courier New", 9),
-            state="disabled"
-        )
-        self.monitor_text.pack(fill="both", expand=True)
-        self.monitor_text.tag_configure("new_line", background="lightgreen")
-
-    def _browse_monitor_file(self):
-        """Browse for a log file to monitor."""
-        filepath = filedialog.askopenfilename(
-            initialdir=self.log_dir if os.path.isdir(self.log_dir) else os.getcwd(),
-            title="Select log file to monitor",
-            filetypes=(("Log files", "application.log*"), ("All files", "*.*"))
-        )
-        if filepath:
-            self.monitor_path_var.set(filepath)
-
-    def _on_filter_type_change(self, *args):
-        """Handle filter type selection change."""
-        filter_type = self.filter_type_var.get()
-        if filter_type in self.filter_presets and filter_type != "Keyword Search":
-            self.filter_var.set(self.filter_presets[filter_type])
-
-    def load_log_file(self):
-        """Open a file dialog to select and load a log file."""
-        filepath = filedialog.askopenfilename(
-            initialdir=self.log_dir if os.path.isdir(self.log_dir) else os.getcwd(),
-            title="Select a log file",
-            filetypes=(("Log files", "application.log*"), ("All files", "*.*"))
-        )
-        if not filepath:
+        if not selected_files:
+            messagebox.showwarning("No Selection", "Please select at least one log file to load.")
             return
 
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                self.all_log_lines = f.readlines()
-            self.current_file = filepath
-            self.file_size = os.path.getsize(filepath)
-            file_size_kb = self.file_size / 1024
-            self.file_label_var.set(f"Loaded: {os.path.basename(filepath)} ({file_size_kb:.1f} KB, {len(self.all_log_lines)} lines)")
-            self.display_logs(self.all_log_lines)
+            combined_content = self._concatenate_and_sort_logs(selected_files)
+            self.all_log_lines = combined_content.splitlines(True) # Keep newlines
+            
+            total_size = sum(os.path.getsize(f) for f in selected_files)
+            file_count = len(selected_files)
+            self.file_label_var.set(f"Loaded {file_count} files ({total_size/1024:.1f} KB, {len(self.all_log_lines)} lines)")
+            
+            self.apply_filter()
+            
+            if self.log_selection_window:
+                self.log_selection_window.destroy()
+
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load file: {e}")
+            messagebox.showerror("Error", f"Failed to load or process logs: {e}")
             self.all_log_lines = []
 
     def on_filter_change(self, *args):
         """Callback function that triggers filtering when the user types."""
         self.apply_filter()
 
-    def apply_filter(self):
-        """Filter and highlight log lines based on the search term."""
-        filter_term = self.filter_var.get()
-        if not self.all_log_lines:
-            return
-
-        if not filter_term:
-            self.display_logs(self.all_log_lines)
-            return
-
-        case_sensitive = self.case_sensitive_var.get()
-        filter_type = self.filter_type_var.get()
-        
-        try:
-            if filter_type == "Custom Regex":
-                filtered_lines = [line for line in self.all_log_lines 
-                                if re.search(filter_term, line, 0 if case_sensitive else re.IGNORECASE)]
-                self.display_logs(filtered_lines, highlight_term=filter_term, is_regex=True)
-            else:
-                filtered_lines = [line for line in self.all_log_lines 
-                                if filter_term.lower() in line.lower()] if not case_sensitive else \
-                               [line for line in self.all_log_lines if filter_term in line]
-                self.display_logs(filtered_lines, highlight_term=filter_term, is_regex=False)
-        except re.error as e:
-            messagebox.showerror("Regex Error", f"Invalid regex pattern: {e}")
-
     def clear_filter(self):
-        """Clear the filter entry and show all log lines."""
+        """Clear the filter entry and re-apply filters."""
         self.filter_var.set("")
-        self.display_logs(self.all_log_lines)
+        self.apply_filter()
+
+    def _concatenate_and_sort_logs(self, file_paths):
+        """
+        Reads multiple log files, concatenates their content, and sorts it chronologically.
+        """
+        all_lines = []
+        timestamp_pattern = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}")
+
+        for path in file_paths:
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        # Only include lines that appear to be valid log entries
+                        if timestamp_pattern.match(line):
+                            all_lines.append(line)
+            except IOError as e:
+                messagebox.showerror("File Error", f"Error reading file {path}: {e}")
+                return ""
+
+        # The timestamp format (YYYY-MM-DD HH:MM:SS,ms) is naturally sortable as a string.
+        all_lines.sort()
+
+        return "".join(all_lines)
 
     def display_logs(self, lines_to_display, highlight_term=None, is_regex=False):
         """
         Updates the text widget with the given lines and optionally highlights a term.
+        For very large results, skip highlighting to prevent hang.
+        Formats columns clearly with alignment, or shows command-only if enabled.
         """
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", tk.END)
+        # Clear all tags before re-populating
+        for tag in self.log_text.tag_names():
+            self.log_text.tag_remove(tag, "1.0", tk.END)
 
-        for line in lines_to_display:
-            self.log_text.insert(tk.END, line)
+        # Determine formatting and prepare search term regex if needed
+        if self.command_only_var.get():
+            line_formatter = self._extract_command
+            # Insert header for command-only view
+            self.log_text.insert(tk.END, "Command / Message\n", ("header",))
+            self.log_text.insert(tk.END, ("-" * 120) + "\n", ("header",))
+        else:
+            line_formatter = self._format_log_line
+            # Insert header for full log view
+            header = f"{'DateTime':<24} {'Level':<10} {'Source':<25} {'Message'}\n"
+            self.log_text.insert(tk.END, header, ("header",))
+            self.log_text.insert(tk.END, ("-" * 120) + "\n", ("header",))
 
+        search_term_regex = None
         if highlight_term:
-            self.highlight_matches(highlight_term, is_regex)
+            try:
+                # For plain text search, escape special characters
+                pattern = highlight_term if is_regex else re.escape(highlight_term)
+                search_term_regex = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                search_term_regex = None # Ignore invalid regex
+
+        # --- Highlighting Logic ---
+        # Process and insert line by line, applying tags during insertion
+        for line in lines_to_display:
+            formatted_line = line_formatter(line)
+            
+            # Collect all matches for this line (syntax and search term)
+            matches = defaultdict(list)
+            
+            # Syntax highlighting matches
+            if not self.command_only_var.get():
+                for tag, pattern in HIGHLIGHT_PATTERNS.items():
+                    for match in pattern.finditer(formatted_line):
+                        matches[tag].append(match.span())
+
+            # User search term matches
+            if search_term_regex:
+                for match in search_term_regex.finditer(formatted_line):
+                    matches["highlight"].append(match.span())
+
+            # If no matches, insert the whole line at once (fast path)
+            if not matches:
+                self.log_text.insert(tk.END, formatted_line + '\n')
+                continue
+
+            # If there are matches, insert the line in tagged segments
+            last_end = 0
+            all_spans = sorted([(start, end, tag) for tag, spans in matches.items() for start, end in spans])
+
+            for start, end, tag in all_spans:
+                if start >= last_end:
+                    # Insert text before the current match
+                    if start > last_end:
+                        self.log_text.insert(tk.END, formatted_line[last_end:start])
+                    # Insert the matched text with its tag
+                    self.log_text.insert(tk.END, formatted_line[start:end], (tag,))
+                    last_end = end
+            
+            # Insert any remaining text after the last match
+            if last_end < len(formatted_line):
+                self.log_text.insert(tk.END, formatted_line[last_end:])
+            
+            self.log_text.insert(tk.END, '\n')
 
         self.log_text.config(state="disabled")
 
-    def highlight_matches(self, term, is_regex=False):
-        """Finds and applies highlighting to all occurrences of a term."""
-        self.log_text.tag_remove("highlight", "1.0", tk.END)
-        start_pos = "1.0"
+    def _extract_command(self, line):
+        """Extract only the command/message part from a log line.
         
-        try:
-            if is_regex:
-                content = self.log_text.get("1.0", tk.END)
-                for match in re.finditer(term, content, re.IGNORECASE):
-                    start_idx = match.start()
-                    end_idx = match.end()
-                    start_pos = self.log_text.index(f"1.0+{start_idx}c")
-                    end_pos = self.log_text.index(f"1.0+{end_idx}c")
-                    self.log_text.tag_add("highlight", start_pos, end_pos)
-            else:
-                while True:
-                    start_pos = self.log_text.search(term, start_pos, stopindex=tk.END, nocase=True)
-                    if not start_pos:
-                        break
-                    end_pos = f"{start_pos}+{len(term)}c"
-                    self.log_text.tag_add("highlight", start_pos, end_pos)
-                    start_pos = end_pos
-        except Exception as e:
-            messagebox.showerror("Highlight Error", f"Error highlighting text: {e}")
-
-    def analyze_timings(self):
-        """Analyze command timing from log file."""
-        if not self.all_log_lines:
-            messagebox.showwarning("No Data", "Load a log file first")
-            return
-
-        pattern = self.timing_pattern_var.get()
-        try:
-            timestamps = []
-            command_times = []
-            
-            # Extract timestamps and commands
-            for line in self.all_log_lines:
-                # Try to extract timestamp (common formats: HH:MM:SS, [HH:MM:SS.mmm], etc.)
-                time_match = re.search(r'\[?(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\]?', line)
-                if time_match:
-                    timestamps.append(time_match.group(1))
-                
-                if re.search(pattern, line, re.IGNORECASE):
-                    command_times.append(time_match.group(1) if time_match else "N/A")
-
-            # Calculate time differences
-            results = "=== Command Timing Analysis ===\n\n"
-            results += f"Total log lines: {len(self.all_log_lines)}\n"
-            results += f"Lines with timestamps: {len(timestamps)}\n"
-            results += f"Commands found: {len(command_times)}\n"
-            results += f"Pattern used: {pattern}\n"
-            results += "\n" + "="*40 + "\n\n"
-
-            if len(timestamps) > 1:
-                results += "Time intervals between log entries:\n"
-                for i in range(min(20, len(timestamps)-1)):
-                    results += f"  Entry {i+1} to {i+2}: Timestamp {timestamps[i]} -> {timestamps[i+1]}\n"
-                if len(timestamps) > 20:
-                    results += f"  ... and {len(timestamps)-20} more entries\n"
-
-            results += "\n" + "="*40 + "\n"
-            results += "Commands detected:\n"
-            for i, cmd_time in enumerate(command_times[:30], 1):
-                results += f"  Command {i}: {cmd_time}\n"
-            if len(command_times) > 30:
-                results += f"  ... and {len(command_times)-30} more commands\n"
-
-            self.timing_text.config(state="normal")
-            self.timing_text.delete("1.0", tk.END)
-            self.timing_text.insert(tk.END, results)
-            self.timing_text.config(state="disabled")
-
-        except re.error as e:
-            messagebox.showerror("Regex Error", f"Invalid pattern: {e}")
-
-    def export_timings(self):
-        """Export timing analysis to a file."""
-        if not self.timing_text.get("1.0", tk.END).strip():
-            messagebox.showwarning("No Data", "Run analysis first")
-            return
-
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if filepath:
-            try:
-                with open(filepath, 'w') as f:
-                    f.write(self.timing_text.get("1.0", tk.END))
-                messagebox.showinfo("Success", f"Results exported to: {filepath}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to export: {e}")
-
-    def toggle_monitoring(self):
-        """Toggle real-time log monitoring."""
-        if self.monitoring:
-            self.monitoring = False
-            self.monitor_button.config(text="Start Monitoring")
-            self.monitor_status_var.set("Status: Stopped")
+        Log format: DATE TIME - LEVEL - SOURCE - COMMAND
+        Example: 2025-11-26 11:28:31,281 - DEBUG - Ieee488Connection - TCPIP0::10.1.53.153::hislip0::INSTR <-- FETCh:DUT:MODem:STATe:RRC?
+        We want: FETCh:DUT:MODem:STATe:RRC?
+        """
+        # Split by " - " to separate columns
+        parts = line.split(" - ")
+        
+        if len(parts) >= 4:
+            # Format: DATE TIME | LEVEL | SOURCE | COMMAND
+            # Get the 4th part and everything after (in case command contains " - ")
+            command = " - ".join(parts[3:]).rstrip()
+            return command
+        elif len(parts) >= 3:
+            # Fallback: DATE TIME | LEVEL | COMMAND
+            command = " - ".join(parts[2:]).rstrip()
+            return command
         else:
-            filepath = self.monitor_path_var.get()
-            if not os.path.isfile(filepath):
-                messagebox.showerror("Error", "Invalid file path")
-                return
-            self.monitoring = True
-            self.monitor_button.config(text="Stop Monitoring")
-            self.monitor_status_var.set("Status: Monitoring...")
-            self.monitor_thread = threading.Thread(target=self._monitor_log_file, daemon=True)
-            self.monitor_thread.start()
+            # No dashes found, return the whole line
+            return line.rstrip()
 
-    def _monitor_log_file(self):
-        """Monitor log file for changes and display new lines."""
-        filepath = self.monitor_path_var.get()
-        last_size = 0
+    def _format_log_line(self, line):
+        """Parse and format a log line with aligned columns.
         
-        try:
-            while self.monitoring:
-                try:
-                    current_size = os.path.getsize(filepath)
-                    if current_size > last_size:
-                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                            f.seek(last_size)
-                            new_lines = f.readlines()
-                            last_size = current_size
-                        
-                        self.monitor_text.config(state="normal")
-                        for line in new_lines:
-                            self.monitor_text.insert(tk.END, line, "new_line")
-                        self.monitor_text.see(tk.END)
-                        self.monitor_text.config(state="disabled")
-                except IOError:
-                    pass
-                
-                time.sleep(float(self.refresh_rate_var.get()))
-        except Exception as e:
-            self.monitor_status_var.set(f"Status: Error - {str(e)}")
+        Log format: DATE TIME - LEVEL - SOURCE - MESSAGE
+        Example: 2025-11-26 11:28:31,281 - DEBUG - Ieee488Connection - TCPIP0::...
+        """
+        # Split by " - " to get the dash-separated parts
+        parts = line.split(" - ")
+        
+        if len(parts) >= 3:
+            # Extract: date+time, level, source, message
+            datetime_col = parts[0].strip() if len(parts) > 0 else ""
+            level_col = parts[1].strip() if len(parts) > 1 else ""
+            source_col = parts[2].strip() if len(parts) > 2 else ""
+            message = " - ".join(parts[3:]).strip() if len(parts) > 3 else ""
+            
+            # Format with fixed column widths for alignment
+            # Date (12) | Time (12) | Level (10) | Source (25) | Message
+            formatted = f"{datetime_col:<24} {level_col:<10} {source_col:<25} {message}"
+            return formatted
+        else:
+            # Fallback for malformed lines
+            return line.rstrip()
 
 def main():
     root = tk.Tk()

@@ -39,6 +39,7 @@ class LogAnalyzerApp:
         # --- UI Setup ---
         self._setup_widgets()
 
+
     def _setup_widgets(self):
         """Create and arrange all the GUI widgets."""
         main_frame = ttk.Frame(self.root, padding="10")
@@ -171,7 +172,7 @@ class LogAnalyzerApp:
         # --- Text Filtering ---
         if filter_term:
             case_sensitive = self.case_sensitive_var.get()
-            
+
             if case_sensitive:
                 text_filtered_lines = [line for line in working_lines if filter_term in line]
             else:
@@ -422,6 +423,7 @@ class LogAnalyzerApp:
         else:
             # Fallback for malformed lines
             return line.rstrip()
+
 
 def main():
     root = tk.Tk()
